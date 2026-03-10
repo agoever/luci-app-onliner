@@ -1,130 +1,180 @@
+<%#
+Copyright 2008 Steven Barth <steven@midlink.org>
+Copyright 2008-2011 Jo-Philipp Wich <jow@openwrt.org>
+Licensed to the public under the Apache License 2.0.
+-%>
+
+<%
+local util = require "luci.util"
+local function online_data()
+	local rv = { }
+	local fd = util.execi('/usr/bin/awk \'BEGIN{while ((getline < "/tmp/dhcp.leases") > 0){a[$2]=$4;}while ((getline < "/proc/net/arp") > 0){if (!a[$4]){a[$4]="\?";}if (match($3,"0x[26]")){"ping -q -c 1 "$1" &";if (b[$4]){b[$4]=b[$4]"/"$1;}else{b[$4]=$1;}c[$4]=$6;}}while (("ip -6 neighbor show | grep -v fe80" | getline) > 0){if (b[$5]) {"ping -q -c 1 "$1" &";b[$5]=b[$5]"/"$1;}}for (mac in b){print(a[mac],b[mac],mac,c[mac]);}}\' ')
+	while true do
+		local ln = fd()
+		if ln == nil then break end
+		local name,ip,mac,dev = ln:match("^(%S+) (%S+) (%S+) (%S+)")
+		if mac and ip and name and dev then
+			rv[#rv+1] = {
+				hostname = name,
+				device  = dev,
+				macaddr  = mac,
+				ipaddr   = ip
+			}
+		end
+	end
+	return rv
+end
+
+
+if luci.http.formvalue("status") == "1" then
+	local rv = {
+		onlines   = online_data()
+	}
+	luci.http.prepare_content("application/json")
+	luci.http.write_json(rv)
+	return
+end
+%>
+
 <%+header%>
 
-<script type="text/javascript" src="<%=url('luci-static/resources/cbi.js')%>"></script>
-<script type="text/javascript">
-// 简单MAC厂商库，你可以自己继续加
-var mac_vendors = {
-    "00:1A:11": "Apple",
-    "00:1B:63": "Dell",
-    "00:1C:42": "Hewlett-Packard",
-    "00:22:69": "ASUS",
-    "00:23:AB": "Sony",
-    "18:65:90": "Xiaomi",
-    "28:6C:07": "TP-Link",
-    "30:5A:3A": "Huawei",
-    "44:03:34": "Intel",
-    "48:46:FB": "Apple",
-    "58:44:98": "Apple",
-    "6C:E8:BD": "Xiaomi",
-    "70:3A:CB": "Apple",
-    "74:23:44": "Samsung",
-    "84:7C:9B": "Realtek",
-    "8C:BE:BE": "Xiaomi",
-    "9C:A7:AE": "TP-Link",
-    "AC:84:C6": "Xiaomi",
-    "B8:27:EB": "Raspberry Pi",
-    "F8:34:41": "Apple"
-};
+<style>
+	/* 强制表格固定布局，列宽严格按照百分比分配 */
+	table#online_status_table {
+		table-layout: fixed !important;
+		width: 100% !important;
+		border-collapse: collapse;
+	}
+	/* 表头样式强化：加粗、背景色、居中 */
+	table#online_status_table th {
+		background-color: #e0e0e0 !important;
+		font-weight: bold !important;
+		text-align: center !important;
+		padding: 8px 5px !important;
+		border: 1px solid #ccc;
+	}
+	/* 数据单元格边框 */
+	table#online_status_table td {
+		border: 1px solid #ddd;
+		padding: 6px 5px;
+	}
+	/* 分别定义各列宽度（表头与数据列一致） */
+	table#online_status_table th:nth-child(1),
+	table#online_status_table td:nth-child(1) {
+		width: 8% !important;  /* 序号列 */
+	}
+	table#online_status_table th:nth-child(2),
+	table#online_status_table td:nth-child(2) {
+		width: 22% !important; /* 主机名 */
+	}
+	table#online_status_table th:nth-child(3),
+	table#online_status_table td:nth-child(3) {
+		width: 27% !important; /* IP */
+	}
+	table#online_status_table th:nth-child(4),
+	table#online_status_table td:nth-child(4) {
+		width: 23% !important; /* MAC */
+	}
+	table#online_status_table th:nth-child(5),
+	table#online_status_table td:nth-child(5) {
+		width: 20% !important; /* 接口 */
+	}
+	/* 单元格内容过长时允许换行 */
+	table#online_status_table td {
+		word-wrap: break-word;
+		word-break: break-all;
+	}
+	/* IPv6 徽章样式优化 */
+	.ipv6-badge {
+		display: inline-block;
+		background-color: #337ab7;
+		color: white;
+		border-radius: 3px;
+		padding: 2px 5px;
+		font-size: 0.8em;
+		margin-left: 5px;
+		white-space: nowrap;
+	}
+</style>
 
-function get_vendor(mac) {
-    if (!mac || mac.length < 17) return "Unknown";
-    var prefix = mac.substr(0, 8).toUpperCase();
-    return mac_vendors[prefix] || "Unknown";
-}
+<script type="text/javascript" src="<%=resource%>/cbi.js?v=git-19.271.33176-b099749"></script>
+<script type="text/javascript">//<![CDATA[
+	function escapeHTML(str) {
+		return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+	}
 
-XHR.poll(5, '<%=url('admin/services/onliner/get_onliner')%>', null,
-    function (type, json) {
-        var list = document.getElementById('online_list');
-        if (!list) return;
-        list.innerHTML = '';
+	XHR.poll(5, '<%=REQUEST_URI%>', { status: 1 },
+		function(x, info)
+		{
+			var ls = document.getElementById('online_status_table');
+			if (ls)
+			{
+				/* 清除所有行（保留表头） */
+				while( ls.rows.length > 1 )
+					ls.rows[0].parentNode.deleteRow(1);
 
-        if (!json || !json.devices) {
-            list.innerHTML = '<tr><td colspan="6"><em>No online devices</em></td></tr>';
-            return;
-        }
+				for( var i = 0; i < info.onlines.length; i++ )
+				{
+					var dev = info.onlines[i];
+					var hostname = escapeHTML(dev.hostname ? dev.hostname : '?');
+					var macaddr = escapeHTML(dev.macaddr);
+					var iface = escapeHTML(dev.device);
 
-        json.devices.forEach(function(dev) {
-            var tr = document.createElement('tr');
-            tr.className = 'cbi-section-table-row';
+					/* 解析 IP 地址列表，分离 IPv4 和 IPv6 */
+					var ips = dev.ipaddr ? dev.ipaddr.split('/') : [];
+					var ipv4s = [];
+					var hasIPv6 = false;
+					for (var j = 0; j < ips.length; j++) {
+						var ip = ips[j];
+						if (ip.indexOf(':') >= 0) {
+							hasIPv6 = true;
+						} else if (ip.indexOf('.') >= 0) {
+							ipv4s.push(escapeHTML(ip));
+						}
+					}
 
-            // 设备名称
-            var td_name = document.createElement('td');
-            td_name.style.width = '18%';
-            td_name.textContent = dev.name || dev.mac || '?';
-            tr.appendChild(td_name);
+					var ipv4Html = ipv4s.length > 0 ? ipv4s.join(', ') : '—';
+					if (hasIPv6) {
+						ipv4Html += ' <span class="ipv6-badge">IPv6</span>';
+					}
 
-            // MAC + 厂商
-            var td_mac = document.createElement('td');
-            td_mac.style.width = '24%';
-            td_mac.style.fontFamily = 'monospace';
-            td_mac.textContent = dev.mac || '—';
-            tr.appendChild(td_mac);
+					var tr = ls.rows[0].parentNode.insertRow(-1);
+					tr.className = 'cbi-section-table-row cbi-rowstyle-' + ((i % 2) + 1);
 
-            // 厂商
-            var td_vendor = document.createElement('td');
-            td_vendor.style.width = '14%';
-            td_vendor.textContent = get_vendor(dev.mac);
-            tr.appendChild(td_vendor);
+					// 插入序号列
+					tr.insertCell(-1).innerHTML = i + 1;
+					tr.insertCell(-1).innerHTML = hostname;
+					tr.insertCell(-1).innerHTML = ipv4Html;
+					tr.insertCell(-1).innerHTML = macaddr;
+					tr.insertCell(-1).innerHTML = iface;
+				}
 
-            // IPv4
-            var td_ipv4 = document.createElement('td');
-            td_ipv4.style.width = '16%';
-            td_ipv4.textContent = dev.ipv4 || '—';
-            tr.appendChild(td_ipv4);
+				if( ls.rows.length == 1 )
+				{
+					var tr = ls.rows[0].parentNode.insertRow(-1);
+					tr.className = 'cbi-section-table-row';
+					var td = tr.insertCell(-1);
+					td.colSpan = 5;
+					td.innerHTML = '<em><br /><%:没有在线设备%></em>';
+				}
+			}
+		}
+	);
+//]]></script>
 
-            // IPv6 标识
-            var td_ipv6 = document.createElement('td');
-            td_ipv6.style.width = '8%';
-            td_ipv6.style.textAlign = 'center';
-            if (dev.ipv6 && dev.ipv6.length > 0) {
-                td_ipv6.innerHTML = '<span style="color:#009a50; font-weight:bold">IPv6</span>';
-            } else {
-                td_ipv6.textContent = '—';
-            }
-            tr.appendChild(td_ipv6);
-
-            // 信号强度
-            var td_signal = document.createElement('td');
-            td_signal.style.width = '10%';
-            td_signal.style.textAlign = 'center';
-            var signal = dev.signal || dev.rssi;
-            if (signal) {
-                td_signal.textContent = signal + " dBm";
-            } else {
-                td_signal.textContent = '—';
-            }
-            tr.appendChild(td_signal);
-
-            // 在线时长
-            var td_uptime = document.createElement('td');
-            td_uptime.style.width = '10%';
-            td_uptime.style.textAlign = 'right';
-            td_uptime.textContent = dev.uptime || '—';
-            tr.appendChild(td_uptime);
-
-            list.appendChild(tr);
-        });
-    }
-);
-</script>
-
-<div class="cbi-map">
-    <h2>在线设备</h2>
-    <div class="cbi-section">
-        <div class="cbi-section-descr">当前局域网所有在线设备</div>
-        <div class="cbi-section-table">
-            <div class="cbi-section-table-titles">
-                <div class="cbi-section-table-cell" style="width:18%">设备名称</div>
-                <div class="cbi-section-table-cell" style="width:24%">MAC 地址</div>
-                <div class="cbi-section-table-cell" style="width:14%">厂商</div>
-                <div class="cbi-section-table-cell" style="width:16%">IPv4</div>
-                <div class="cbi-section-table-cell" style="width:8%; text-align:center">IPv6</div>
-                <div class="cbi-section-table-cell" style="width:10%; text-align:center">信号</div>
-                <div class="cbi-section-table-cell" style="width:10%; text-align:right">时长</div>
-            </div>
-            <div id="online_list" class="cbi-section-table-row cbi-rowstyle-1"></div>
-        </div>
-    </div>
-</div>
+<fieldset class="cbi-section">
+	<table class="cbi-section-table" id="online_status_table">
+		<tr class="cbi-section-table-titles">
+			<th class="cbi-section-table-cell"><%:序号%></th>
+			<th class="cbi-section-table-cell"><%:主机名%></th>
+			<th class="cbi-section-table-cell"><%:IP%></th>
+			<th class="cbi-section-table-cell"><%:MAC%></th>
+			<th class="cbi-section-table-cell"><%:接口%></th>
+		</tr>
+		<tr class="cbi-section-table-row">
+			<td colspan="5"><em><br /><%:正在收集数据...%></em></td>
+		</tr>
+	</table>
+</fieldset>
 
 <%+footer%>
