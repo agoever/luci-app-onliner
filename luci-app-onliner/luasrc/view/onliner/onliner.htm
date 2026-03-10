@@ -7,174 +7,435 @@ Licensed to the public under the Apache License 2.0.
 <%
 local util = require "luci.util"
 local function online_data()
-	local rv = { }
-	local fd = util.execi('/usr/bin/awk \'BEGIN{while ((getline < "/tmp/dhcp.leases") > 0){a[$2]=$4;}while ((getline < "/proc/net/arp") > 0){if (!a[$4]){a[$4]="\?";}if (match($3,"0x[26]")){"ping -q -c 1 "$1" &";if (b[$4]){b[$4]=b[$4]"/"$1;}else{b[$4]=$1;}c[$4]=$6;}}while (("ip -6 neighbor show | grep -v fe80" | getline) > 0){if (b[$5]) {"ping -q -c 1 "$1" &";b[$5]=b[$5]"/"$1;}}for (mac in b){print(a[mac],b[mac],mac,c[mac]);}}\' ')
-	while true do
-		local ln = fd()
-		if ln == nil then break end
-		local name,ip,mac,dev = ln:match("^(%S+) (%S+) (%S+) (%S+)")
-		if mac and ip and name and dev then
-			rv[#rv+1] = {
-				hostname = name,
-				device  = dev,
-				macaddr  = mac,
-				ipaddr   = ip
-			}
-		end
-	end
-	return rv
+    local rv = { }
+    
+    local function normalize_mac(mac)
+        return mac:gsub("[%-:]", ""):upper():gsub("(%w%w)", "%1:"):sub(1,17)
+    end
+
+    -- 获取桥接端口到接口名的映射（端口号从1开始）
+    local port_to_iface = {}
+    do
+        local brif_dir = "/sys/class/net/br-lan/brif/"
+        local dir = io.popen("ls " .. brif_dir .. " 2>/dev/null | sort")
+        if dir then
+            local port = 1
+            for iface in dir:lines() do
+                port_to_iface[port] = iface
+                port = port + 1
+            end
+            dir:close()
+        end
+    end
+
+    -- 预判接口频段（根据常见MTK命名）
+    local iface_to_band = {}
+    for port, iface in pairs(port_to_iface) do
+        if iface:match("^ra%d") then
+            iface_to_band[iface] = "2.4G"
+        elseif iface:match("^rax") then
+            iface_to_band[iface] = "5G"
+        end
+    end
+
+    -- 获取MAC到端口号的映射（通过brctl）
+    local mac_to_port = {}
+    do
+        local f = io.popen("brctl showmacs br-lan 2>/dev/null")
+        if f then
+            for line in f:lines() do
+                local port, mac, local_flag = line:match("^%s*(%d+)%s+([:%x]+)%s+(%w+)")
+                if port and mac and local_flag == "no" then
+                    mac_to_port[normalize_mac(mac)] = tonumber(port)
+                end
+            end
+            f:close()
+        end
+    end
+
+    -- 获取在线设备数据
+    local fd = util.execi('/usr/bin/awk \'BEGIN{while ((getline < "/tmp/dhcp.leases") > 0){a[$2]=$4;}while ((getline < "/proc/net/arp") > 0){if (!a[$4]){a[$4]="\?";}if (match($3,"0x[26]")){"ping -q -c 1 "$1" &";if (b[$4]){b[$4]=b[$4]"/"$1;}else{b[$4]=$1;}c[$4]=$6;}}while (("ip -6 neighbor show | grep -v fe80" | getline) > 0){if (b[$5]) {"ping -q -c 1 "$1" &";b[$5]=b[$5]"/"$1;}}for (mac in b){print(a[mac],b[mac],mac,c[mac]);}}\' ')
+    while true do
+        local ln = fd()
+        if ln == nil then break end
+        local name,ip,mac,dev = ln:match("^(%S+) (%S+) (%S+) (%S+)")
+        if mac and ip and name and dev then
+            local conn_type = "有线"
+            local mac_upper = normalize_mac(mac)
+            local reason = "默认有线"
+            local port = mac_to_port[mac_upper]
+
+            -- 无线判断：根据端口号区分2.4G/5G
+            if port == 5 or port == 6 then
+                local iface = port_to_iface[port]
+                if iface and iface_to_band[iface] then
+                    conn_type = iface_to_band[iface]  -- "2.4G" 或 "5G"
+                    reason = "brctl " .. iface .. " " .. conn_type
+                else
+                    conn_type = "无线"
+                    reason = "brctl 无线通道(port " .. port .. ")"
+                end
+            end
+
+            rv[#rv+1] = {
+                hostname = name,
+                device  = dev,
+                macaddr  = mac,
+                ipaddr   = ip,
+                conn_type = conn_type,
+                debug_reason = reason
+            }
+        end
+    end
+
+    return { onlines = rv, probe = { hostapd_cli=0, ubus=0, iwinfo=0 } }
 end
 
-
 if luci.http.formvalue("status") == "1" then
-	local rv = {
-		onlines   = online_data()
-	}
-	luci.http.prepare_content("application/json")
-	luci.http.write_json(rv)
-	return
+    local data = online_data()
+    luci.http.prepare_content("application/json")
+    luci.http.write_json(data)
+    return
 end
 %>
 
 <%+header%>
 
 <style>
-	/* 强制表格固定布局，列宽严格按照百分比分配 */
-	table#online_status_table {
-		table-layout: fixed !important;
-		width: 100% !important;
-		border-collapse: collapse;
-	}
-	/* 表头样式强化：加粗、背景色、居中 */
-	table#online_status_table th {
-		background-color: #e0e0e0 !important;
-		font-weight: bold !important;
-		text-align: center !important;
-		padding: 8px 5px !important;
-		border: 1px solid #ccc;
-	}
-	/* 数据单元格边框 */
-	table#online_status_table td {
-		border: 1px solid #ddd;
-		padding: 6px 5px;
-	}
-	/* 分别定义各列宽度（表头与数据列一致） */
-	table#online_status_table th:nth-child(1),
-	table#online_status_table td:nth-child(1) {
-		width: 8% !important;  /* 序号列 */
-	}
-	table#online_status_table th:nth-child(2),
-	table#online_status_table td:nth-child(2) {
-		width: 22% !important; /* 主机名 */
-	}
-	table#online_status_table th:nth-child(3),
-	table#online_status_table td:nth-child(3) {
-		width: 27% !important; /* IP */
-	}
-	table#online_status_table th:nth-child(4),
-	table#online_status_table td:nth-child(4) {
-		width: 23% !important; /* MAC */
-	}
-	table#online_status_table th:nth-child(5),
-	table#online_status_table td:nth-child(5) {
-		width: 20% !important; /* 接口 */
-	}
-	/* 单元格内容过长时允许换行 */
-	table#online_status_table td {
-		word-wrap: break-word;
-		word-break: break-all;
-	}
-	/* IPv6 徽章样式优化 */
-	.ipv6-badge {
-		display: inline-block;
-		background-color: #337ab7;
-		color: white;
-		border-radius: 3px;
-		padding: 2px 5px;
-		font-size: 0.8em;
-		margin-left: 5px;
-		white-space: nowrap;
-	}
+    .table-responsive {
+        width: 100%;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+    }
+    table#online_status_table {
+        border-collapse: collapse;
+        width: 100%;
+    }
+    /* 表头样式：粘性定位 */
+    table#online_status_table thead th {
+        background-color: #e0e0e0 !important;
+        font-weight: bold !important;
+        text-align: center !important;
+        padding: 8px 5px !important;
+        border: 1px solid #ccc;
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        vertical-align: middle !important;
+    }
+    /* 数据单元格：垂直居中，水平左对齐 */
+    table#online_status_table td {
+        border: 1px solid #ddd;
+        padding: 6px 5px;
+        vertical-align: middle !important;
+        text-align: left;
+    }
+
+    /* 桌面端固定百分比列宽 */
+    @media screen and (min-width: 601px) {
+        table#online_status_table {
+            table-layout: fixed !important;
+        }
+        table#online_status_table thead th:nth-child(1),
+        table#online_status_table tbody td:nth-child(1) {
+            width: 3% !important;
+        }
+        table#online_status_table thead th:nth-child(2),
+        table#online_status_table tbody td:nth-child(2) {
+            width: 13% !important;
+        }
+        table#online_status_table thead th:nth-child(3),
+        table#online_status_table tbody td:nth-child(3) {
+            width: 15% !important;
+        }
+        table#online_status_table thead th:nth-child(4),
+        table#online_status_table tbody td:nth-child(4) {
+            width: 35% !important;
+        }
+        table#online_status_table thead th:nth-child(5),
+        table#online_status_table tbody td:nth-child(5) {
+            width: 25% !important;
+        }
+        table#online_status_table thead th:nth-child(6),
+        table#online_status_table tbody td:nth-child(6) {
+            width: 9% !important;
+        }
+        table#online_status_table td {
+            word-wrap: break-word;
+            word-break: break-all;
+        }
+    }
+
+    /* 移动端：固定列宽，所有列不换行，主机名列超出显示省略号 */
+    @media screen and (max-width: 600px) {
+        table#online_status_table {
+            table-layout: auto !important;
+            width: max-content !important;
+            max-width: none !important;
+        }
+        table#online_status_table thead th,
+        table#online_status_table tbody td {
+            padding: 6px 8px !important;
+            font-size: 0.85em;
+            vertical-align: middle !important;
+        }
+        /* 所有列默认不换行 */
+        table#online_status_table tbody td {
+            white-space: nowrap !important;
+            word-break: keep-all !important;
+            overflow: hidden !important;
+        }
+        /* 固定列宽 */
+        table#online_status_table thead th:nth-child(1),
+        table#online_status_table tbody td:nth-child(1) {
+            width: 25px !important;
+        }
+        table#online_status_table thead th:nth-child(2),
+        table#online_status_table tbody td:nth-child(2) {
+            width: 40px !important;
+        }
+        table#online_status_table thead th:nth-child(3),
+        table#online_status_table tbody td:nth-child(3) {
+            width: 100px !important;
+            max-width: 100px !important;
+            text-overflow: ellipsis !important;  /* 主机名超出显示省略号 */
+        }
+        table#online_status_table thead th:nth-child(4),
+        table#online_status_table tbody td:nth-child(4) {
+            width: 140px !important;
+        }
+        table#online_status_table thead th:nth-child(5),
+        table#online_status_table tbody td:nth-child(5) {
+            width: 120px !important;
+        }
+        table#online_status_table thead th:nth-child(6),
+        table#online_status_table tbody td:nth-child(6) {
+            width: 70px !important;
+        }
+        /* 确保其他列不显示省略号（如果需要） */
+        table#online_status_table tbody td:not(:nth-child(3)) {
+            text-overflow: clip !important;
+        }
+    }
+
+    .ipv6-badge {
+        display: inline-block;
+        background-color: #337ab7;
+        color: white;
+        border-radius: 3px;
+        padding: 2px 5px;
+        font-size: 0.8em;
+        margin-left: 5px;
+        white-space: nowrap;
+    }
+    
+    .conn-wired {
+        color: #555;
+    }
+    .conn-wireless, .conn-2\.4g, .conn-5g {
+        color: #2e7d32;
+        font-weight: bold !important;
+    }
+    
+    #debugTools {
+        margin-top: 20px;
+        border-top: 1px dashed #ccc;
+        padding-top: 10px;
+    }
+    #debugOutput {
+        background: #f5f5f5;
+        padding: 10px;
+        border: 1px solid #ddd;
+        display: none;
+        white-space: pre-wrap;
+        font-size: 12px;
+        max-height: 300px;
+        overflow: auto;
+    }
 </style>
 
 <script type="text/javascript" src="<%=resource%>/cbi.js?v=git-19.271.33176-b099749"></script>
 <script type="text/javascript">//<![CDATA[
-	function escapeHTML(str) {
-		return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-	}
+    function escapeHTML(str) {
+        return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
 
-	XHR.poll(5, '<%=REQUEST_URI%>', { status: 1 },
-		function(x, info)
-		{
-			var ls = document.getElementById('online_status_table');
-			if (ls)
-			{
-				/* 清除所有行（保留表头） */
-				while( ls.rows.length > 1 )
-					ls.rows[0].parentNode.deleteRow(1);
+    function ipToNumber(ip) {
+        if (!ip || ip === '—') return 0;
+        var parts = ip.split('.');
+        if (parts.length !== 4) return 0;
+        return ((+parts[0]) * 256 + (+parts[1])) * 65536 + (+parts[2]) * 256 + (+parts[3]);
+    }
 
-				for( var i = 0; i < info.onlines.length; i++ )
-				{
-					var dev = info.onlines[i];
-					var hostname = escapeHTML(dev.hostname ? dev.hostname : '?');
-					var macaddr = escapeHTML(dev.macaddr);
-					var iface = escapeHTML(dev.device);
+    function sortByIP(a, b) {
+        var ipsA = a.ipaddr ? a.ipaddr.split('/') : [];
+        var ipsB = b.ipaddr ? b.ipaddr.split('/') : [];
+        var ipA = '—', ipB = '—';
+        for (var i = 0; i < ipsA.length; i++) {
+            if (ipsA[i].indexOf('.') >= 0) {
+                ipA = ipsA[i];
+                break;
+            }
+        }
+        for (var i = 0; i < ipsB.length; i++) {
+            if (ipsB[i].indexOf('.') >= 0) {
+                ipB = ipsB[i];
+                break;
+            }
+        }
+        var numA = ipToNumber(ipA);
+        var numB = ipToNumber(ipB);
+        if (ipA === '—' && ipB === '—') return 0;
+        if (ipA === '—') return 1;
+        if (ipB === '—') return -1;
+        return numA - numB;
+    }
 
-					/* 解析 IP 地址列表，分离 IPv4 和 IPv6 */
-					var ips = dev.ipaddr ? dev.ipaddr.split('/') : [];
-					var ipv4s = [];
-					var hasIPv6 = false;
-					for (var j = 0; j < ips.length; j++) {
-						var ip = ips[j];
-						if (ip.indexOf(':') >= 0) {
-							hasIPv6 = true;
-						} else if (ip.indexOf('.') >= 0) {
-							ipv4s.push(escapeHTML(ip));
-						}
-					}
+    window.lastData = null;
 
-					var ipv4Html = ipv4s.length > 0 ? ipv4s.join(', ') : '—';
-					if (hasIPv6) {
-						ipv4Html += ' <span class="ipv6-badge">IPv6</span>';
-					}
+    function checkTable() {
+        var ls = document.getElementById('online_status_table');
+        return ls ? '表格存在，行数：' + ls.rows.length : '表格不存在';
+    }
 
-					var tr = ls.rows[0].parentNode.insertRow(-1);
-					tr.className = 'cbi-section-table-row cbi-rowstyle-' + ((i % 2) + 1);
+    XHR.poll(5, '<%=REQUEST_URI%>', { status: 1 }, function(x, data) {
+        try {
+            window.lastData = data;
+            var ls = document.getElementById('online_status_table');
+            if (!ls) {
+                console.error('表格未找到');
+                return;
+            }
 
-					// 插入序号列
-					tr.insertCell(-1).innerHTML = i + 1;
-					tr.insertCell(-1).innerHTML = hostname;
-					tr.insertCell(-1).innerHTML = ipv4Html;
-					tr.insertCell(-1).innerHTML = macaddr;
-					tr.insertCell(-1).innerHTML = iface;
-				}
+            console.log('数据接收时间：' + new Date().toLocaleTimeString() + '，设备数：' + (data.onlines ? data.onlines.length : 0));
 
-				if( ls.rows.length == 1 )
-				{
-					var tr = ls.rows[0].parentNode.insertRow(-1);
-					tr.className = 'cbi-section-table-row';
-					var td = tr.insertCell(-1);
-					td.colSpan = 5;
-					td.innerHTML = '<em><br /><%:没有在线设备%></em>';
-				}
-			}
-		}
-	);
+            var sorted = data.onlines ? data.onlines.sort(sortByIP) : [];
+
+            // 获取 tbody 元素（如果不存在则创建）
+            var tbody = ls.querySelector('tbody');
+            if (!tbody) {
+                tbody = document.createElement('tbody');
+                ls.appendChild(tbody);
+            }
+
+            // 清空 tbody
+            tbody.innerHTML = '';
+
+            if (sorted.length > 0) {
+                for (var i = 0; i < sorted.length; i++) {
+                    var dev = sorted[i];
+                    var hostname = escapeHTML(dev.hostname ? dev.hostname : '?');
+                    var macaddr = escapeHTML(dev.macaddr);
+                    var iface = escapeHTML(dev.device);
+                    var connType = dev.conn_type ? dev.conn_type : '未知';
+                    var connClass = (connType == '有线') ? 'conn-wired' : 'conn-wireless';
+
+                    var ips = dev.ipaddr ? dev.ipaddr.split('/') : [];
+                    var ipv4s = [];
+                    var hasIPv6 = false;
+                    for (var j = 0; j < ips.length; j++) {
+                        var ip = ips[j];
+                        if (ip.indexOf(':') >= 0) {
+                            hasIPv6 = true;
+                        } else if (ip.indexOf('.') >= 0) {
+                            ipv4s.push(escapeHTML(ip));
+                        }
+                    }
+                    var ipv4Html = ipv4s.length > 0 ? ipv4s.join(', ') : '—';
+                    if (hasIPv6) {
+                        ipv4Html += ' <span class="ipv6-badge">IPv6</span>';
+                    }
+
+                    var tr = tbody.insertRow(-1);
+                    tr.className = 'cbi-section-table-row cbi-rowstyle-' + ((i % 2) + 1);
+
+                    tr.insertCell(-1).innerHTML = i + 1;
+                    tr.insertCell(-1).innerHTML = '<span class="' + connClass + '">' + connType + '</span>';
+                    tr.insertCell(-1).innerHTML = hostname;
+                    tr.insertCell(-1).innerHTML = ipv4Html;
+                    tr.insertCell(-1).innerHTML = macaddr;
+                    tr.insertCell(-1).innerHTML = iface;
+                }
+            } else {
+                var tr = tbody.insertRow(-1);
+                tr.className = 'cbi-section-table-row';
+                var td = tr.insertCell(-1);
+                td.colSpan = 6;
+                td.innerHTML = '<em><br />没有在线设备</em>';
+            }
+        } catch (e) {
+            console.error('XHR回调错误：', e);
+            var debugDiv = document.getElementById('debugOutput');
+            if (debugDiv) {
+                debugDiv.innerText = 'JavaScript 错误：' + e.toString() + '\n堆栈：' + e.stack;
+                debugDiv.style.display = 'block';
+            }
+        }
+    });
+
+    function showDebug() {
+        var debugDiv = document.getElementById('debugOutput');
+        var output = '=== 调试信息 ===\n';
+        output += '页面标题：' + document.title + '\n';
+        var ls = document.getElementById('online_status_table');
+        if (ls) {
+            output += '表格行数：' + ls.rows.length + '\n';
+            if (ls.rows.length > 0) {
+                output += '第一行（表头）HTML：' + ls.rows[0].innerHTML.replace(/</g, '&lt;') + '\n';
+                var firstRowText = ls.rows[0].innerText;
+                output += '第一行文本内容：' + firstRowText + '\n';
+            }
+            if (ls.rows.length > 1) {
+                output += '第二行（第一数据行）HTML：' + ls.rows[1].innerHTML.replace(/</g, '&lt;') + '\n';
+            }
+            output += '表格整体结构（前200字符）：' + ls.outerHTML.substring(0,200).replace(/</g, '&lt;') + '\n';
+        } else {
+            output += '表格不存在\n';
+        }
+        if (window.lastData) {
+            output += '最后数据接收时间：' + (window.lastData._time || '未知') + '\n';
+            output += '数据内容：\n' + JSON.stringify(window.lastData, null, 2);
+        } else {
+            output += '暂无数据，请等待几秒后重试。\n';
+        }
+        debugDiv.innerText = output;
+        debugDiv.style.display = 'block';
+    }
+
+    // 记录数据接收时间以便调试
+    var originalXHR = XHR.poll;
+    XHR.poll = function(interval, url, params, callback) {
+        originalXHR(interval, url, params, function(x, data) {
+            if (data) data._time = new Date().toLocaleTimeString();
+            callback(x, data);
+        });
+    };
 //]]></script>
 
 <fieldset class="cbi-section">
-	<table class="cbi-section-table" id="online_status_table">
-		<tr class="cbi-section-table-titles">
-			<th class="cbi-section-table-cell"><%:序号%></th>
-			<th class="cbi-section-table-cell"><%:主机名%></th>
-			<th class="cbi-section-table-cell"><%:IP%></th>
-			<th class="cbi-section-table-cell"><%:MAC%></th>
-			<th class="cbi-section-table-cell"><%:接口%></th>
-		</tr>
-		<tr class="cbi-section-table-row">
-			<td colspan="5"><em><br /><%:正在收集数据...%></em></td>
-		</tr>
-	</table>
+    <div class="table-responsive">
+        <table class="cbi-section-table" id="online_status_table">
+            <thead>
+                <tr class="cbi-section-table-titles">
+                    <th class="cbi-section-table-cell">序号</th>
+                    <th class="cbi-section-table-cell">连接</th>
+                    <th class="cbi-section-table-cell">主机名</th>
+                    <th class="cbi-section-table-cell">IP</th>
+                    <th class="cbi-section-table-cell">MAC</th>
+                    <th class="cbi-section-table-cell">接口</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr class="cbi-section-table-row">
+                    <td colspan="6"><em><br />正在收集数据...</em></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+    <div id="debugTools">
+        <button type="button" onclick="showDebug()" style="padding:5px 10px;">显示调试信息</button>
+        <pre id="debugOutput"></pre>
+    </div>
 </fieldset>
 
 <%+footer%>
