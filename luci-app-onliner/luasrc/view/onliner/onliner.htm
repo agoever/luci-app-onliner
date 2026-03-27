@@ -53,8 +53,49 @@ local function online_data()
         end
     end
 
+    -- 从 DHCP 租约文件中估算每个 MAC 的租约开始时间（假设默认租约12小时）
+    local mac_to_start = {}
+    do
+        local lease_fd = io.open("/tmp/dhcp.leases", "r")
+        if lease_fd then
+            local default_lease = 43200  -- 12小时，单位秒
+            for line in lease_fd:lines() do
+                local expiry, mac, ip, hostname = line:match("^(%d+) (%S+) (%S+) (%S+)")
+                if expiry and mac then
+                    local expiry_time = tonumber(expiry)
+                    if expiry_time then
+                        local start_time = expiry_time - default_lease
+                        if start_time > 0 then
+                            mac_to_start[normalize_mac(mac)] = start_time
+                        end
+                    end
+                end
+            end
+            lease_fd:close()
+        end
+    end
+
+    -- 获取设备首次在线时间戳（通过临时文件缓存）
+    local first_seen = {}
+    local cache_file = "/tmp/luci_onliner_cache"
+    local now = os.time()
+    
+    -- 读取缓存文件
+    local cache_fd = io.open(cache_file, "r")
+    if cache_fd then
+        for line in cache_fd:lines() do
+            local mac, ts = line:match("^(%S+)%s+(%d+)$")
+            if mac and ts then
+                first_seen[mac] = tonumber(ts)
+            end
+        end
+        cache_fd:close()
+    end
+
     -- 获取在线设备数据
     local fd = util.execi('/usr/bin/awk \'BEGIN{while ((getline < "/tmp/dhcp.leases") > 0){a[$2]=$4;}while ((getline < "/proc/net/arp") > 0){if (!a[$4]){a[$4]="\?";}if (match($3,"0x[26]")){"ping -q -c 1 "$1" &";if (b[$4]){b[$4]=b[$4]"/"$1;}else{b[$4]=$1;}c[$4]=$6;}}while (("ip -6 neighbor show | grep -v fe80" | getline) > 0){if (b[$5]) {"ping -q -c 1 "$1" &";b[$5]=b[$5]"/"$1;}}for (mac in b){print(a[mac],b[mac],mac,c[mac]);}}\' ')
+    
+    local current_macs = {}
     while true do
         local ln = fd()
         if ln == nil then break end
@@ -77,15 +118,52 @@ local function online_data()
                 end
             end
 
+            -- 记录当前在线的MAC
+            current_macs[mac_upper] = true
+            
+            -- 计算在线时长（分钟）
+            local online_minutes = 0
+            if first_seen[mac_upper] then
+                online_minutes = math.floor((now - first_seen[mac_upper]) / 60)
+            else
+                -- 尝试从 DHCP 估算时间中获取
+                local dhcp_start = mac_to_start[mac_upper]
+                if dhcp_start and dhcp_start > 0 and dhcp_start <= now then
+                    first_seen[mac_upper] = dhcp_start
+                    online_minutes = math.floor((now - dhcp_start) / 60)
+                else
+                    first_seen[mac_upper] = now
+                    online_minutes = 0
+                end
+            end
+
             rv[#rv+1] = {
                 hostname = name,
                 device  = dev,
                 macaddr  = mac,
                 ipaddr   = ip,
                 conn_type = conn_type,
-                debug_reason = reason
+                debug_reason = reason,
+                online_minutes = online_minutes
             }
         end
+    end
+
+    -- 清理缓存：移除已不在线的设备，保留在线的设备时间戳
+    local new_cache = {}
+    for mac, ts in pairs(first_seen) do
+        if current_macs[mac] then
+            new_cache[mac] = ts
+        end
+    end
+    
+    -- 写回缓存文件
+    local cache_fd_w = io.open(cache_file, "w")
+    if cache_fd_w then
+        for mac, ts in pairs(new_cache) do
+            cache_fd_w:write(mac .. " " .. ts .. "\n")
+        end
+        cache_fd_w:close()
     end
 
     return { onlines = rv, probe = { hostapd_cli=0, ubus=0, iwinfo=0 } }
@@ -131,7 +209,7 @@ end
         text-align: left;
     }
 
-    /* 桌面端固定百分比列宽 */
+    /* 桌面端固定百分比列宽（新增在线时长列） */
     @media screen and (min-width: 601px) {
         table#online_status_table {
             table-layout: fixed !important;
@@ -150,15 +228,19 @@ end
         }
         table#online_status_table thead th:nth-child(4),
         table#online_status_table tbody td:nth-child(4) {
-            width: 35% !important;
+            width: 30% !important;
         }
         table#online_status_table thead th:nth-child(5),
         table#online_status_table tbody td:nth-child(5) {
-            width: 25% !important;
+            width: 18% !important;
         }
         table#online_status_table thead th:nth-child(6),
         table#online_status_table tbody td:nth-child(6) {
-            width: 9% !important;
+            width: 12% !important;  /* 在线时长列 */
+        }
+        table#online_status_table thead th:nth-child(7),
+        table#online_status_table tbody td:nth-child(7) {
+            width: 9% !important;   /* 接口列 */
         }
         table#online_status_table td {
             word-wrap: break-word;
@@ -166,7 +248,7 @@ end
         }
     }
 
-    /* 移动端：固定列宽，所有列不换行，主机名列超出显示省略号 */
+    /* 移动端：固定列宽，所有列不换行，主机名列超出显示省略号（新增在线时长列） */
     @media screen and (max-width: 600px) {
         table#online_status_table {
             table-layout: auto !important;
@@ -202,17 +284,21 @@ end
         }
         table#online_status_table thead th:nth-child(4),
         table#online_status_table tbody td:nth-child(4) {
-            width: 140px !important;
+            width: 130px !important;
         }
         table#online_status_table thead th:nth-child(5),
         table#online_status_table tbody td:nth-child(5) {
-            width: 120px !important;
+            width: 110px !important;
         }
         table#online_status_table thead th:nth-child(6),
         table#online_status_table tbody td:nth-child(6) {
-            width: 70px !important;
+            width: 100px !important;  /* 在线时长列 */
         }
-        /* 确保其他列不显示省略号（如果需要） */
+        table#online_status_table thead th:nth-child(7),
+        table#online_status_table tbody td:nth-child(7) {
+            width: 65px !important;  /* 接口列 */
+        }
+        /* 确保其他列不显示省略号 */
         table#online_status_table tbody td:not(:nth-child(3)) {
             text-overflow: clip !important;
         }
@@ -258,6 +344,33 @@ end
 <script type="text/javascript">//<![CDATA[
     function escapeHTML(str) {
         return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    function formatDuration(minutes) {
+        if (minutes < 60) {
+            return minutes + "分钟";
+        } else if (minutes < 1440) {
+            var hours = Math.floor(minutes / 60);
+            var mins = minutes % 60;
+            if (mins > 0) {
+                return hours + "小时" + mins + "分";
+            } else {
+                return hours + "小时";
+            }
+        } else {
+            var days = Math.floor(minutes / 1440);
+            var hours = Math.floor((minutes % 1440) / 60);
+            var mins = minutes % 60;
+            if (hours > 0 && mins > 0) {
+                return days + "天" + hours + "小时" + mins + "分";
+            } else if (hours > 0) {
+                return days + "天" + hours + "小时";
+            } else if (mins > 0) {
+                return days + "天" + mins + "分";
+            } else {
+                return days + "天";
+            }
+        }
     }
 
     function ipToNumber(ip) {
@@ -329,6 +442,7 @@ end
                     var iface = escapeHTML(dev.device);
                     var connType = dev.conn_type ? dev.conn_type : '未知';
                     var connClass = (connType == '有线') ? 'conn-wired' : 'conn-wireless';
+                    var onlineTime = dev.online_minutes ? formatDuration(dev.online_minutes) : '刚刚上线';
 
                     var ips = dev.ipaddr ? dev.ipaddr.split('/') : [];
                     var ipv4s = [];
@@ -354,13 +468,14 @@ end
                     tr.insertCell(-1).innerHTML = hostname;
                     tr.insertCell(-1).innerHTML = ipv4Html;
                     tr.insertCell(-1).innerHTML = macaddr;
+                    tr.insertCell(-1).innerHTML = onlineTime;
                     tr.insertCell(-1).innerHTML = iface;
                 }
             } else {
                 var tr = tbody.insertRow(-1);
                 tr.className = 'cbi-section-table-row';
                 var td = tr.insertCell(-1);
-                td.colSpan = 6;
+                td.colSpan = 7;  // 现在是7列
                 td.innerHTML = '<em><br />没有在线设备</em>';
             }
         } catch (e) {
@@ -422,18 +537,14 @@ end
                     <th class="cbi-section-table-cell">主机名</th>
                     <th class="cbi-section-table-cell">IP</th>
                     <th class="cbi-section-table-cell">MAC</th>
+                    <th class="cbi-section-table-cell">在线时长</th>
                     <th class="cbi-section-table-cell">接口</th>
-                </tr>
+                 </tr>
             </thead>
-            <!--
-            <tbody>
-                <tr class="cbi-section-table-row">
-                    <td colspan="6"><em><br />正在收集数据...</em></td>
-                </tr>
-            </tbody>
-            -->
-        </table>
+            <!-- 数据行由JS动态填充 -->
+         </table>
     </div>
+    <!-- 调试工具（可选） -->
     <!--
     <div id="debugTools">
         <button type="button" onclick="showDebug()" style="padding:5px 10px;">显示调试信息</button>
