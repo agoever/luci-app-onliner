@@ -53,18 +53,49 @@ local function online_data()
         end
     end
 
-    -- 从 DHCP 租约文件中估算每个 MAC 的租约开始时间（假设默认租约12小时）
+    -- 从 dnsmasq 获取实际的 DHCP 默认租约时间（秒）
+    local lease_duration = 43200  -- 默认12小时
+    do
+        -- 方法1: 从 dnsmasq 进程参数读取
+        local ps_fd = io.popen("ps | grep dnsmasq | grep -v grep | sed -n 's/.*--dhcp-lease-max=[0-9]\\+ --dhcp-lease=\\([0-9]\\+\\).*/\\1/p'")
+        if ps_fd then
+            local line = ps_fd:read("*l")
+            if line then
+                local lease = tonumber(line)
+                if lease and lease > 0 then
+                    lease_duration = lease
+                end
+            end
+            ps_fd:close()
+        end
+
+        -- 方法2: 如果没找到，从 dnsmasq 配置文件读取
+        if lease_duration == 43200 then
+            local conf_fd = io.open("/etc/dnsmasq.conf", "r")
+            if conf_fd then
+                for line in conf_fd:lines() do
+                    local lease = line:match("^dhcp%-lease=%s*(%d+)")
+                    if lease then
+                        lease_duration = tonumber(lease)
+                        break
+                    end
+                end
+                conf_fd:close()
+            end
+        end
+    end
+
+    -- 从 DHCP 租约文件中估算每个 MAC 的租约开始时间（使用实际租约时长）
     local mac_to_start = {}
     do
         local lease_fd = io.open("/tmp/dhcp.leases", "r")
         if lease_fd then
-            local default_lease = 43200  -- 12小时，单位秒
             for line in lease_fd:lines() do
                 local expiry, mac, ip, hostname = line:match("^(%d+) (%S+) (%S+) (%S+)")
                 if expiry and mac then
                     local expiry_time = tonumber(expiry)
                     if expiry_time then
-                        local start_time = expiry_time - default_lease
+                        local start_time = expiry_time - lease_duration
                         if start_time > 0 then
                             mac_to_start[normalize_mac(mac)] = start_time
                         end
@@ -539,10 +570,10 @@ end
                     <th class="cbi-section-table-cell">MAC</th>
                     <th class="cbi-section-table-cell">在线时长</th>
                     <th class="cbi-section-table-cell">接口</th>
-                 </tr>
+                  </tr>
             </thead>
             <!-- 数据行由JS动态填充 -->
-         </table>
+          </table>
     </div>
     <!-- 调试工具（可选） -->
     <!--
